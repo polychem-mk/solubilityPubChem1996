@@ -1,0 +1,9 @@
+joblib
+matplotlib
+numpy
+pandas>=2.0
+pyarrow>=14.0
+pyprojroot
+rdkit
+scikit-learn>=1.3
+seaborn

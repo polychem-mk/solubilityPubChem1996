@@ -1,0 +1,33 @@
+name: solubility-env
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - r-base>=4.4 
+
+  #  Python (Minimum Versions) 
+  - pandas>=2.2 
+  - numpy>=1.26
+  - scikit-learn>=1.4
+  - matplotlib>=3.8
+  - seaborn>=0.13
+  - pyarrow>=15.0
+  - rdkit>=2023.09
+
+  # R (Minimum Versions) 
+  - r-dplyr>=1.1
+  - r-ggplot2>=3.5
+  - r-arrow>=15.0 
+  - r-gt>=0.10
+  - r-rmarkdown>=2.26
+  - r-knitr>=1.46
+
+  #  Utility Packages
+  - joblib
+  - pyprojroot
+  - r-ggcorrplot
+  - r-here
+  - r-magick
+  - r-patchwork
+  - r-stringr
