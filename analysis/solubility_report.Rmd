@@ -1,0 +1,458 @@
+---
+title: Predicting Aqueous Solubility of Small Molecules
+bibliography: bibliography.bibtex
+csl: citation_style.csl
+link-citations: true
+output:
+  html_document:
+    css: styles.css
+    df_print: paged
+    highlight: kate
+    toc: yes
+    toc_depth: 3
+    toc_float:
+      collapsed: false
+      smooth_scroll: false
+    code_fold: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE,
+                      dpi = 300, fig.align='center')
+```
+
+```{r libraries_variables}
+library(dplyr)
+library(ggplot2)
+library(gt)
+library(ggcorrplot)
+library(arrow)
+library(here)
+library(magick)
+library(patchwork)
+library(stringr)
+
+# --- Load ---
+
+# Function. Print a gt_tbl table (using gt package)
+source(here("analysis/utils/print_gt_table.R"))
+
+# Processed data with descriptors
+dat <- read_feather(here("data/processed/PubChem1996Descriptors.feather"))
+dat$solubility <- factor(dat$solubility, 
+                         levels = c("low", "moderate", "high"), 
+                         ordered = TRUE)
+# Metadata
+metadata <- read.csv(here("data/processed/descriptor_metadata.csv"))
+
+# Feature importance
+feature_importance <- read.csv(here("results/tables/feature_importances.csv")) 
+
+# Confusion matrix
+confusion_matrix <- read.csv(here("results/tables/confusion_matrix.csv"))
+
+# ROC AUC table
+roc_auc <- read.csv(here("results/tables/roc_auc.csv")) 
+
+# Modeling results
+model_comparison <- read.csv(here("results/tables/model_comparison.csv"))
+final_rf_metrics <- read.csv(here("results/tables/final_rf_metrics.csv"))
+
+# Figures
+confusion_matrix_img <- image_read(here("results/figures/confusion_matrix.png"))
+feature_importance_img <- image_read(here("results/figures/feature_importance.png"))
+roc_curves_img <- image_read(here("results/figures/roc_curves.png"))
+
+# --- Theme settings ---
+title_color = "#708090"
+font_base_size = 12
+
+```
+
+# 1. Introduction
+
+Determining the solubility of organic compounds in aqueous solutions at physiological pH (approximately 7.4) is an important first step in many cheminformatics workflows, such as drug discovery and biological activity assessments. Experimental measurement is resource-intensive and time-consuming, making accurate in silico prediction highly valuable for early-stage compound screening[@Boobier2020; @Fowles2025].
+
+The **goal** of this project is to build a classification model for predicting the solubility of small molecules in water ([low]{.value_name}, [moderate]{.value_name}, [high]{.value_name}) using simple 2D molecular descriptors calculated with the RDKit package.
+
+# 2. Data and Preprocessing
+
+The dataset was downloaded from the PubChem BioAssay database AID 1996: [Water solubility from standard MLSMR solutions]((https://pubchem.ncbi.nlm.nih.gov/bioassay/1996)). It contains measured water solubility values for small organic molecules[@PubChemBioAssay1996].
+
+After removing header rows and duplicate entries, and retaining CID, SMILES and mean solubility at pH 7.4, the final processed dataset contains `r nrow(dat)` compounds with canonical SMILES and a derived categorical solubility labels:
+
+- [low]{.value_name}: < 10 μg/mL  
+- [moderate]{.value_name}: 10–60 μg/mL  
+- [high]{.value_name}: > 60 μg/mL
+
+The resulting dataset is included in this project as starting data.
+
+All 2D molecular descriptors were calculated using the RDKit library [@rdkit]. Rare missing descriptor values were imputed using class-conditional means (stratified by solubility category).
+
+The first six rows of the processed descriptor table are shown below:
+
+```{r data_overview, results='asis'}
+print_gt_table(head(dat),
+               table_title = "First 6 Rows of the Processed Dataset with 2D Descriptors")
+```
+
+# 3. Target Distribution
+
+::: {.columns}
+::: {.column}
+
+The dataset includes **`r n_distinct(dat$SMILES)` unique compounds** with the following distribution across solubility categories at pH 7.4:
+
+- [high]{.value_name}: `r scales::percent(mean(dat$solubility == "high"), accuracy = 0.1)`
+- [moderate]{.value_name} : `r scales::percent(mean(dat$solubility == "moderate"), accuracy = 0.1)`
+- [low]{.value_name} : `r scales::percent(mean(dat$solubility == "low"), accuracy = 0.1)`
+
+The class distribution is heavily imbalanced, with the majority of compounds falling into the [moderate]{.value_name}-solubility category. This imbalance was addressed during modeling using class-weighted Random Forest training.
+
+:::
+::: {.column}
+
+```{r target_distribution_plot,  fig.width = 7, fig.height = 4.5}
+
+ggplot(dat, aes(x = solubility)) +
+  geom_bar(fill = "#B0C4DE", color = "black", width = 0.6) +
+  scale_x_discrete(limits = c("low", "moderate", "high"),
+                   labels = c("Low\n(<10 μg/mL)",
+                              "Moderate\n(10–60 μg/mL)",
+                              "High\n(>60 μg/mL)")) +
+  labs(title = "Distribution of Solubility Classes",
+       x = "Solubility Category",
+       y = "Number of Compounds") +
+  theme_light(base_size = font_base_size+6) +
+  theme(plot.title = element_text(size = rel(1.2),
+                                  hjust = 0.5, 
+                                  colour = title_color),
+        axis.text.x = element_text(size = rel(0.9)))
+```
+
+*Figure 1. Bar plot showing the distribution of compounds across solubility categories.*
+:::
+:::
+
+___
+
+# 4. Descriptor Distributions
+
+The dataset with calculated features contains **`r nrow(metadata)`**  descriptors. The descriptor metadata table includes the original function names and brief descriptions from the RDKit documentation.
+
+```{r descriptor_metadata_table, echo=FALSE, results='asis'}
+print_gt_table(metadata,
+               pagination = TRUE,
+               table_title = "Computed Molecular Descriptors") %>%
+  cols_label(descriptor = "descriptor",
+             rdkit_function = "RDKit function",
+             molecular_property = "molecular property") %>%
+  cols_width(starts_with("molecular") ~ px(550),
+             everything() ~ px(150))
+```
+
+The distributions of the top 10 most important descriptors (ranked by combined MDI + permutation importance from the model trained on all features) are shown below, alongside box plots stratified by solubility class.
+
+```{r descriptor_distributions,  fig.width = 10, fig.height = 4.5}
+# Shared plot theme
+plot_theme = theme_light(base_size = font_base_size) +
+    theme(title = element_text(size = font_base_size, hjust = 0.5, colour = title_color),
+          plot.margin = margin(35, 20, 35, 15, "pt"),
+          axis.title = element_text(colour = "black"))  
+
+feature_importance_top10 <- feature_importance %>%
+  slice_max(combined, n = 10) %>%
+  pull(descriptor)
+
+# Generate plots for top 10
+for(i in feature_importance_top10){
+  df = dat %>% select(solubility, all_of(i))
+  colnames(df) = c("solubility", "value")
+  molecular_property = metadata$molecular_property[metadata$descriptor == i] %>%
+    str_remove_all("^Calculates |,$|\\.$")
+  
+  # Distributions of descriptors
+  title = paste("Distribution of", molecular_property)
+  title = paste(strwrap(title, width = 45), collapse = "\n")
+  p_hist <- ggplot(df, aes(x = value)) +
+    geom_histogram(bins = 40, fill = "#B0C4DE", color = "black", alpha = 0.8) +
+    labs(title = title, x = i, y = "Count") +
+    plot_theme
+  
+  # Boxplot by class
+  title = paste("By solubility class:", molecular_property)
+  title = paste(strwrap(title, width = 45), collapse = "\n")
+  p_box <- ggplot(df, aes(x = solubility, y = value)) +
+    geom_boxplot(fill = "#E0E5E5", color = "black", outlier.alpha = 0.6) +
+    labs(title = title, x = "Solubility", y = i) +
+    plot_theme
+  
+  # Combine plots
+  print(p_hist + p_box) #+ plot_layout(widths = c(1, 1))
+}
+```
+
+*Figure 2. Combined histograms and box plots for the 10 most predictive descriptors, ranked by feature importance.*
+
+____________________________
+
+# 5. Feature Correlations
+
+```{r descriptor_groups}
+# Define descriptor groups from metadata
+
+# Count-based descriptors
+count_descr = metadata %>%
+  filter(str_detect(rdkit_function, "Num|Count|fr_")) %>%
+  filter(str_detect(descriptor, "_rel", negate = TRUE)) %>%
+  pull(descriptor)
+
+# Carbon-normalized versions of count-based descriptors
+rel_descr <- metadata %>%
+  filter(str_detect(descriptor, "_rel")) %>%
+  pull(descriptor)
+
+# Charge-based descriptors
+charge_descr <- metadata %>%
+  filter(str_detect(descriptor, "peoe_vsa|charge")) %>%
+  pull(descriptor)
+
+# Other descriptors
+other_descr <- setdiff(metadata$descriptor, c(count_descr, rel_descr, charge_descr))
+```
+
+To assess multicollinearity and potential redundancy, Pearson correlation matrices were computed for logical groups of descriptors:
+
+- **Count-based**: Integer counts of structural features, (e.g., number of rotatable bonds, heteroatoms, etc., excluding the number of bond types), `r length(count_descr)` descriptors;   
+- **Carbon-normalized count-based**: Same counts divided by carbon atom count (`*_rel`), `r length(rel_descr)` descriptors;   
+- **Charge-based**: Partial charge and PEOE_VSA descriptors, `r length(charge_descr)` descriptors;  
+- **Other**:  physicochemical properties such as molecular weight, LogP, TPSA, etc.,  `r length(other_descr)` descriptors.   
+
+```{r correlation, fig.width = 7, fig.height = 4.5}
+groups = list(
+  Count_based_and_physicochemical = c(other_descr, count_descr),  
+  Normalized_count_based_and_physicochemical = c(other_descr, rel_descr),
+  Charge_based = charge_descr
+)
+
+# Correlation matrices
+for(i in 1:length(groups)){
+  corr_mat = cor(dat[, groups[[i]]], use = "pairwise.complete.obs")
+  title = paste(str_replace_all(names(groups)[i], "_", " "),
+                "molecular descriptors")
+  title = paste(strwrap(title, width = 50), collapse = "\n")
+  
+  p <- ggcorrplot(corr_mat, 
+                  type = "lower", 
+                  title = title, 
+                  legend.title = "",
+                  lab = TRUE,
+                  lab_size = 2,
+                  colors = c("#446499", "white", "#B95062"))+
+    theme(
+      plot.title = element_text(size = font_base_size-1, hjust = 0.5, colour = title_color),
+      axis.text.x = element_text(angle = 45, hjust = 1, size = font_base_size-4),
+      axis.text.y = element_text(hjust = 1, size = font_base_size-4)
+    ) 
+  
+  print(p)
+}
+
+# Compare correlations: the number of pairs of descriptors with a correlation
+# coefficient greater than 0.8
+corr_count <- cor(dat[, count_descr], use = "pairwise.complete.obs")
+corr_count <- (sum(abs(corr_count[upper.tri(corr_count)]) > 0.8))
+
+corr_rel_count <- cor(dat[, rel_descr], use = "pairwise.complete.obs")
+corr_rel_count <- (sum(abs(corr_rel_count[upper.tri(corr_rel_count)]) > 0.8))
+```
+
+*Figure 3. Pearson correlation matrices for three descriptor groups.*  
+
+___
+
+Key Observations  
+&nbsp;&nbsp;• Carbon-normalized versions show higher correlations with each other:  
+&nbsp;&nbsp;&nbsp;&nbsp;◦ Original count-based: `r corr_count` pairs with |r| > 0.8   
+&nbsp;&nbsp;&nbsp;&nbsp;◦ Normalized: `r corr_rel_count` pairs with |r| > 0.8    
+&nbsp;&nbsp;• However, normalization slightly weakens correlations with key physicochemical properties (MW, LogP, Bertz index).    
+&nbsp;&nbsp;• Charge-based descriptors exhibit generally low inter-correlation, with the strongest relationship between MaxPartialCharge and peoe_vsa14 (r = `r round(cor(dat$peoe_vsa14, dat$max_part_charge), 2)`).   
+
+These patterns support the use of both original and normalized count-based features in the final model to capture complementary information.
+
+# 6. Model Performance
+
+The predictive model was built using **Random Forest**, a robust machine learning algorithm well-suited for imbalanced datasets and requiring minimal data preprocessing[@scikit].
+
+To handle class imbalance, we applied class weighting. Our primary evaluation metric was **precision** for the [high]{.value_name} and [moderate]{.value_name} solubility classes, as these compounds are considered **active** and suitable for further study.
+
+Four models were compared:
+
+- **Baseline**: Default Random Forest using original RDKit descriptors
+- **+ Normalized descriptors**: Added carbon-normalized versions of count-based features
+- **+ Feature selection**: Selected most predictive descriptors
+- **Final tuned model**: Optimized tree structure and depth on selected features
+
+All models used 2000 trees for fair comparison.
+
+```{r model_performance}
+print_gt_table(model_comparison,
+               table_title = "Model performance comparison: macro-averaged precision on test set") %>%
+  cols_align(align = "center")
+```
+<br>
+
+Adding carbon-normalized descriptors resulted in a slight improvement in overall performance, while hyperparameter tuning allowed for achieving the best results in predicting the [moderate]{.value_name} solubility class.
+
+# 7. Final Model Evaluation
+
+The final tuned model achieved an overall accuracy of 
+`r round(final_rf_metrics[which(final_rf_metrics$class == "accuracy") ,2], 4)`
+on the held-out test set.
+
+::: {.columns}
+::: {.column}
+
+```{r final_model_metrics}
+final_rf_metrics <- final_rf_metrics %>%
+  filter(!class %in% c("accuracy", "oob_score")) %>%
+  mutate(across(where(is.numeric), round, digits = 4))
+
+print_gt_table(final_rf_metrics,
+               table_title = "Final Model performance on test set \n by solubility class")
+```
+
+:::
+::: {.column}
+
+```{r confusion_matrix_plot, fig.cap="*Figure 4. Classification results for final model on Test Set*"}
+print(confusion_matrix_img, info = FALSE)
+```
+
+:::
+:::
+
+<br>
+Key insights:
+
+- Excellent prediction of [moderate]{.value_name} solubility (precision = 
+`r final_rf_metrics[2,2]`)  
+- [high]{.value_name} solubility is more challenging (precision =
+`r final_rf_metrics[3,2]`), reflecting its rarity in the dataset  
+- Most misclassified [high]{.value_name} predictions are actually 
+[moderate]{.value_name} 
+compounds — still biologically active, which is acceptable for screening purposes  
+
+___
+
+The multi-class ROC curves use the one-vs-rest approach, showing the model’s ability to distinguish each solubility class from the others. Higher values of the area under the curve (AUC) indicate that the model is able to effectively rank compounds according to the probability of their belonging to each class.
+
+::: {.columns}
+::: {.column}
+
+```{r cm_roc}
+# The order of classes in the confusion matrix is: low, moderate, high
+confusion_matrix = as.matrix(t(confusion_matrix))
+
+# Specificity calculation for each class
+n <- sum(confusion_matrix)
+tp <- diag(confusion_matrix)
+fp <- rowSums(confusion_matrix) - tp
+fn <- colSums(confusion_matrix) - tp
+tn <- n - (tp + fp + fn)
+
+specificity <- tn / (tn + fp)
+
+# Table: class, ROC AUC, FPR
+row_ind <- c(which(roc_auc$class == "low"),
+             which(roc_auc$class == "moderate"),
+             which(roc_auc$class == "high"))
+roc_auc[row_ind,] %>% 
+  bind_cols(fpr = 1- specificity) %>% 
+  print_gt_table(table_title = "Area under the ROC curve and False Positive Rate on test set by solubility class") %>%
+  cols_label(auc_ovr = "ROC AUC, one-vs-rest",
+             fpr = "FPR") %>%
+  cols_align(align = "center")
+```
+
+:::
+::: {.column}
+
+```{r roc_plot, fig.cap="*Figure 5. Receiver Operating Characteristic curves (low vs rest AUC = 0.86, moderate vs rest AUC = 0.87, high vs rest AUC = 0.99)*"}
+print(roc_curves_img, info = FALSE)
+```
+
+:::
+:::
+
+The final model shows high one-vs-rest ROC AUC values across all classes. However, high AUC values in imbalanced datasets can be misleading because the metric is dominated by the abundance of true negatives (high specificity and correspondingly low False Positive Rate for minority class), masking poor performance on the rare class [@Imani2025Preprints; @Ghanem2023].   
+As we can see, the [high]{.value_name} solubility class shows AUC = 0.99 and FPR = 0.013, but low precision (0.501). Thus, when the model predicts [high]{.value_name}, only about half are correct, reflecting the challenge of identifying rare class even when ranking is strong.   
+Conversely, the [moderate]{.value_name} class benefits from higher prevalence, leading to both high recall and precision. The [low]{.value_name} class shows balanced, moderate performance. The strong AUC values for these two classes ([low]{.value_name} vs rest AUC = 0.86, [moderate]{.value_name} vs rest AUC = 0.87) further support the model’s ability to effectively rank compounds by their probability of belonging to these specific classes.
+
+___
+
+# 8. Feature Importance & Selected Descriptors
+
+Molecular solubility is governed by a balance between **hydrophobic** (lipophilic) and **hydrophilic** contributions. Key physicochemical principles include:
+
+- Larger, more complex molecules are less soluble. In general, similar compounds with lower molecular weights are more soluble in water than larger compounds[@Tolls2002].
+- Polar functional groups (H-bond donors/acceptors, heteroatoms) enhance water interactions[@Lemke2011].
+- Partial atomic charges and polar surface area reflect the molecule's ability to form favorable dipole–dipole or hydrogen bonds with water [@Stromgaard2016].
+
+```{r selected_descriptors}
+feature_importance <- feature_importance %>%
+  filter(selected == "True") %>%
+  pull(descriptor)
+```
+
+::: {.columns}
+::: {.column}
+
+The final model identified **`r length(feature_importance)`** descriptors as most predictive.
+**Molecular weight** (MW) and the **Bertz complexity index** emerged as the strongest predictors, consistent with their known influence on solubility through molecular size and structural complexity [@Bertz1981]. These two features are moderately correlated (r ≈ `r round(cor(dat$mw, dat$bertz), 2)`).  
+<br>  
+
+Notably, **`r sum(str_detect(feature_importance, "peoe_vsa|charge"))`** out of `r length(feature_importance)` selected descriptors are **charge-related** (PEOE_VSA series and partial charges), underscoring the importance of electrostatic interactions in aqueous solvation. PEOE_VSA descriptors represent the amount of a molecule's Van der Waals surface area (VSA) that carries a specific range of partial atomic charges, therefore indicate the molecule's ability to interact with water dipoles[@Labute2000].
+
+:::
+::: {.column}
+
+```{r feature_importance_plot, fig.cap="*Figure 6. Top Predictive Descriptors Ranked by Importance (Final Model)*", fig.width=10, fig.height=6, echo=FALSE}
+print(feature_importance_img, info = FALSE)
+```
+
+:::
+:::
+
+**Carbon-normalized** versions of count-based features (e.g., n_het_rel, hba_rel) were frequently selected, supporting the hypothesis that solubility depends not only on the presence of functional groups but on their density relative to molecular size.
+These findings align with established QSPR models, where polar surface area, hydrogen-bonding capacity, and charge distribution are consistently used as predictors of aqueous solubility [@Zhang2011; @Konig2024].
+
+___
+
+# Summary
+
+• Simple 2D RDKit descriptors can be effectively used to build classification models for predicting small-molecule aqueous solubility across [low]{.value_name}, [moderate]{.value_name}, or [high]{.value_name} categories.  
+
+• While Random Forest (RF) models can be computationally intensive during training, the modern RandomForestClassifier in scikit-learn offers several advantages for chemical datasets. It inherently handles non-parametric features and imbalanced class distributions. Notably, recent versions of scikit-learn (starting with 1.4) natively support missing values within the tree-splitting process. Furthermore, as a rule-based ensemble method, RF is robust to outliers and does not require features to be within the training range to remain functional on new data, significantly simplifying the feature engineering pipeline[@scikit].   
+
+• In this project, we compared three sets of chemical descriptors:   
+&nbsp;&nbsp;&nbsp;&nbsp;◦ original RDKit descriptors,   
+&nbsp;&nbsp;&nbsp;&nbsp;◦ original descriptors plus carbon-normalized count-based descriptors,    
+&nbsp;&nbsp;&nbsp;&nbsp;◦ a set following a feature selection step.   
+
+• The final pipeline also included hyperparameter tuning. Adding carbon-normalized descriptors slightly improved overall performance, while hyperparameter tuning allowed for achieving the best results in predicting the [moderate]{.value_name} solubility class (precicion = `r final_rf_metrics$precision[final_rf_metrics$class == "moderate"]`).   
+
+• Predicting the [high]{.value_name} solubility class is challenging due to extreme data imbalance (prevalence of `r paste0(round(100*mean(dat$solubility == "high"), 2), "%")`). Most misclassified [high]{.value_name} predictions are actually [moderate]{.value_name}-solubility compounds; given that these are often still biologically active, such errors are acceptable for early-stage screening purposes.
+
+• Feature selection identified `r length(feature_importance)` key predictors:   
+&nbsp;&nbsp;&nbsp;&nbsp;◦ Molecular Weight (MW), Bertz complexity index, and logP emerging as the strongest,   
+&nbsp;&nbsp;&nbsp;&nbsp;◦ `r sum(str_detect(feature_importance, "peoe_vsa|charge"))` of these descriptors were charge-related (PEOE_VSA series and partial charges),   
+&nbsp;&nbsp;&nbsp;&nbsp;◦ `r sum(str_detect(feature_importance, "_rel"))` carbon-normalized descriptors were selected over the original RDKit count-based descriptors. 
+
+• Further model performance improvements can be achieved through several key strategies:   
+&nbsp;&nbsp;&nbsp;&nbsp;◦ Incorporating more complex molecular descriptors: This includes the addition of 3D descriptors to capture stereochemical information.  
+&nbsp;&nbsp;&nbsp;&nbsp;◦ Expanding the training dataset: Specifically targeting the inclusion of more data points for highly soluble organic compounds addresses the current class imbalance.  
+&nbsp;&nbsp;&nbsp;&nbsp;◦ Analyzing misclassified molecules: A detailed analysis of the chemical structures of errors can reveal systematic model biases and guide future feature engineering efforts.  
+
+___
+

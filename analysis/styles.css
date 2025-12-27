@@ -1,0 +1,33 @@
+body {
+  font-family: Helvetica;
+  font-size: 12pt;
+}
+
+h1.title {
+  font-size: 26px;
+  font-family: Helvetica;
+}
+
+h1 {
+  font-family: Helvetica;
+  font-size: 18pt;
+}
+
+pre {
+  font-size: 12px
+}
+
+.value_name {
+  color: #1A5661;
+  font-weight: 700;
+  font-family: Monospace; 
+  font-size: 90%
+}
+
+.columns {
+  display: flex;
+}
+.column {
+  flex: 50%;
+  padding-right: 15px; 
+}
