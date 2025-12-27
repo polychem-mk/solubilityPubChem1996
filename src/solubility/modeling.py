@@ -14,6 +14,7 @@ from sklearn.inspection import permutation_importance
 from sklearn.metrics import (
     classification_report,
     confusion_matrix,
+    roc_auc_score,
 )
 from sklearn.model_selection import (
     GridSearchCV,
@@ -30,7 +31,6 @@ from src.solubility import (
     FIGURES,
     MODELS,
     N_JOBS,
-    RECOMPUTE,
     SCORER,
     SEARCH,
     SEED,    
@@ -165,7 +165,9 @@ def train_rf_model(
     y_train: pd.Series,
     *,
     model_name: str,
-    oob: bool = True,   
+    oob: bool = True,
+    save_model : bool = True,
+    
 ) -> RandomForestClassifier:
     """
     Train and save a RandomForest model with balanced class weights.
@@ -178,6 +180,8 @@ def train_rf_model(
         Identifier used in the filename, e.g. "baseline" or "final".
     oob : bool, default True
         Whether to use out-of-bag samples to estimate the generalization score.
+    save_model : bool, default True
+        Save model to MODELS directory.
     
     Returns
     -------
@@ -203,9 +207,11 @@ def train_rf_model(
         print(f"OOB error rate: {1 - rf.oob_score_:.4f}")
     
     # Save the model
-    path = MODELS / f"{model_name}_rf.joblib"
-    joblib.dump(rf, path, compress=3)
-    print(f"{model_name} model saved to {path}")
+    if save_model:
+        path = MODELS / f"{model_name}_rf.joblib"
+        joblib.dump(rf, path, compress=3)
+        print(f"{model_name} model saved to {path}")
+
     return rf
 
 # --- 5. Save metrics ------------------------------------------
@@ -295,8 +301,9 @@ def select_features(
 
     Notes
     -----
-    This function saves feature importances table as csv file to
-    ``TABLES / "feature_importances.csv"``.
+    This function saves 
+        - feature importances table as csv file to ``TABLES / "feature_importances.csv"``.
+        - list of the selected features to ``FEATURES / "selected_features.joblib"``.
     """
     # Feature importances: MDI + Permutation 
     mdi = model.feature_importances_
@@ -375,6 +382,7 @@ def tune_model(
     y_train: pd.Series,
     *,
     recompute: bool = True,
+    save_search : bool = True,
 ) -> RandomForestClassifier:
     """
     Perform two-stage hyperparameter tuning (Random, Grid) and return final model.
@@ -385,11 +393,20 @@ def tune_model(
         Training data (before feature selection).
     recompute : bool, default True
         If False, load pre-trained final model from disk.
+    save_search : bool, default True
+        Save Randomized Search and Grid Search models to SEARCH directory.
     
     Returns
     -------
     RandomForestClassifier
         Best model trained on full training data with 2000 trees.
+
+    Notes
+    -----
+    This function saves:
+        - Randomized Search and Grid Search models to SEARCH (when ``save_search = True``);
+        - Final model to MODELS.
+    If the parameter ``recompute = False``, but the file "final_model_rf.joblib" does not exist, this will force a recalculation of the final model.
     """
     final_model_path = MODELS / "final_model_rf.joblib"
     random_search_path = SEARCH / "random_search_rf.joblib"
@@ -434,8 +451,9 @@ def tune_model(
     print(f"Best random search score: {random_search.best_score_:.4f}")
     print(f"Best random params: {random_search.best_params_}")
 
-    joblib.dump(random_search, random_search_path, compress=3)
-    print(f"Random search saved to {random_search_path}")
+    if save_search:
+        joblib.dump(random_search, random_search_path, compress=3)
+        print(f"Random search saved to {random_search_path}")
 
     # --- Step 2: Narrow Grid Search around best params ---
     print("\nStarting GridSearchCV around best random params...")
@@ -467,8 +485,9 @@ def tune_model(
     print(f"Best grid search score: {grid_search.best_score_:.4f}")
     print(f"Best grid params: {grid_search.best_params_}")
 
-    joblib.dump(grid_search, grid_search_path, compress=3)
-    print(f"Grid search saved to {grid_search_path}")
+    if save_search:
+        joblib.dump(grid_search, grid_search_path, compress=3)
+        print(f"Grid search saved to {grid_search_path}")
 
     # --- Final model: best params + more trees ---
     print("\nTraining final model with n_estimators=2000...")
@@ -519,6 +538,7 @@ def evaluate_and_plot(
     cm_df_path = TABLES / "confusion_matrix.csv"
     fi_path = FIGURES / "feature_importance.png"
     roc_path = FIGURES / "roc_curves.png"
+    roc_df_path = TABLES / "roc_auc.csv"
 
     # Set class names with correct order 
     if class_names is None:
@@ -582,10 +602,11 @@ def evaluate_and_plot(
         plt.close(fig)
 
     # --- Plot 3: ROC Curves (multi-class) ---
+    class_names = model.classes_
     fig, ax = plot_roc_curve(
         y_true=y_test,
         y_score=y_score,
-        class_names=model.classes_,
+        class_names=class_names,
         title="Final Model — Multi-class ROC Curves",
     )
     if save_plots:
@@ -596,14 +617,23 @@ def evaluate_and_plot(
     else:
         plt.close(fig)
 
+    # Save ROC AUC values to csv file
+    auc_ovr = pd.DataFrame({
+        'class': class_names,
+        'auc_ovr': roc_auc_score(y_test, y_score, multi_class='ovr', average=None)
+    })    
+    auc_ovr.to_csv(roc_df_path, index=False)
+    print(f"ROC AUC values saved to {roc_df_path}")    
+
     print("\nEvaluation complete.")
 
 # -------------------- Modeling pipeline -----------------------
 
 def run_full_modeling_pipeline(
     *,
-    recompute_tuning: bool | None = None,
+    recompute_tuning: bool = True,
     feature_selection: Literal["load", "skip", "recompute"] = "load",
+    save_models : bool = True,
     save_plots: bool = True,
     show_plots: bool = False,
 ) -> None:
@@ -615,12 +645,14 @@ def run_full_modeling_pipeline(
     
     Parameters
     ----------
-    recompute_tuning : bool | None, default None
-        If None, uses RECOMPUTE from config. If True/False, overrides it.
+    recompute_tuning : bool, default True
+        Recompute tuning.
     feature_selection: FeatureSelection = FeatureSelection.LOAD
         - "recompute" - perform feature selection using the input model
         - "load" (default) - load pre-selected features from FEATURES / "selected_features.joblib"
         - "skip" - skip feature selection and use all descriptors
+    save_models : bool, default True
+        Save intermediate models to MODELS and SEARCH directories.
     save_plots : bool, default True
         Save plots to FIGURES directory.
     show_plots : bool, default False
@@ -660,7 +692,9 @@ def run_full_modeling_pipeline(
         X_train[baseline_features],
         y_train,
         model_name="baseline",
-        oob=True)
+        oob=True,
+        save_model = save_models
+        )
     baseline_pred = baseline_model.predict(X_test[baseline_features])
 
     oob_score = getattr(baseline_model, "oob_score_", None)
@@ -681,7 +715,8 @@ def run_full_modeling_pipeline(
         X_train,
         y_train,
         model_name="all_features",
-        oob=True)
+        oob=True,
+        save_model = save_models)
     all_features_pred = all_features_model.predict(X_test)
 
     oob_score = getattr(all_features_model, "oob_score_", None)
@@ -731,7 +766,8 @@ def run_full_modeling_pipeline(
         X_train[selected_features],
         y_train,
         model_name="selected_features",
-        oob=True)
+        oob=True,
+        save_model = save_models)
     selected_features_pred = selected_features_model.predict(X_test[selected_features])
 
     oob_score = getattr(selected_features_model, "oob_score_", None)
@@ -747,12 +783,12 @@ def run_full_modeling_pipeline(
 
     # 7. Final model with hyperparameter tuning
     print("\n7. Hyperparameter tuning and final model training")
-    recompute = RECOMPUTE if recompute_tuning is None else recompute_tuning
-
+    
     final_model = tune_model(
         X_train[selected_features],
         y_train,
-        recompute=recompute,
+        recompute=recompute_tuning,
+        save_search = save_models
     )
 
     # Get features that are used in the final model

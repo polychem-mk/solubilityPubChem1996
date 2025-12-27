@@ -43,6 +43,10 @@ N_JOBS = -2
 # Set RECOMPUTE to False to load saved model
 RECOMPUTE = True
 
+# Set SAVE_MODELS to True to save all intermediate models.
+# If SAVE_MODELS is False, only the final model will be saved.
+SAVE_MODELS = False
+
 SEED = 42
 TEST_SIZE = 0.2
 

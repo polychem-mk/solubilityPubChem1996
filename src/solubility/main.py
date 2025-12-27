@@ -13,7 +13,8 @@ from pathlib import Path
 
 from src.solubility import (
     FEATURE_SELECTION,
-    RECOMPUTE
+    RECOMPUTE,
+    SAVE_MODELS,
 )
 from src.solubility.descriptors import compute_descriptors_pipeline
 from src.solubility.modeling import run_full_modeling_pipeline
@@ -29,8 +30,10 @@ def step_modeling() -> None:
     print("Step 2: Training and evaluating models")
     print("=" * 70)
     run_full_modeling_pipeline(
-        recompute_tuning=RECOMPUTE,  
+        recompute_tuning=RECOMPUTE,
         feature_selection=FEATURE_SELECTION,
+        save_models = SAVE_MODELS,
+        save_plots = True,
         show_plots=False,
     )
 
