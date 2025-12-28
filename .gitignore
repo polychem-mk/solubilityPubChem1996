@@ -4,6 +4,12 @@
 results/hyperparameter_searches/
 results/models/
 
+# processed data
+data/processed
+
+# HTMLs
+README.html
+analysis/solubility_report.html
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
